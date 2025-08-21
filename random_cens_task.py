@@ -5,6 +5,8 @@ import numpy as np
 import json
 import os
 import pandas as pd
+import tempfile
+import shutil
 
 from pathlib import Path
 
@@ -31,13 +33,16 @@ parser.add_argument("contrast_file",
                     help="JSON file with contrasts listed.")
 parser.add_argument("out_dir", type=str,
                     help="Directory to save the individual maps to.")
+parser.add_argument("cens_pct", type=float,
+                    help="Censoring percentage, (0, 1].")
 parser.add_argument("subs", nargs="+",
                     help="Subs (without sub-) to process, at least 1.")
 
-parser.add_argument("--motion", "-m", nargs=2, metavar=("file", "n"),
-                    help="file: CSV with real motion exclusions. "
-                         "n: Number of FD vectors to sample (includes lowest "
-                         "and highest-motion rows).")
+parser.add_argument("--motion", "-m", nargs=1, metavar=("file"),
+                    help="CSV with real motion exclusions")
+
+parser.add_argument("--fd", type=float, default=1,
+                    help="FD threshold, in mm (default: 1 mm)")
 
 args = parser.parse_args()
 
@@ -47,29 +52,27 @@ task_label = args.task
 space_label = "MNI152NLin2009cAsym"
 sub_labels = args.subs
 out_dir = args.out_dir
-
-mot_file = args.motion[0]
-mot_n = int(args.motion[1])
-
 contrasts_file = args.contrast_file
 
-def directory_exists(dir):
+cens_pct = args.cens_pct
+fd_thresh = args.fd
 
-    if os.path.isdir(dir):
+assert cens_pct > 0, "Censoring percentage must be > 0"
+assert cens_pct <= 1, "Censoring percentage cannot be > 1."
 
-        # Check if there are t maps in the directory
 
-        t_maps = glob.glob(f"{dir}/**/*_stat-t_statmap.nii.gz", recursive=True)
-        if len(t_maps) > 0:
-            print(f"There are {len(t_maps)} t statmaps in {dir}, delete to "
-                  "re-run.")
-            return(True)
-        else:
-            print(f"There are 0 t statmaps in {dir}, running.")
-            return(False)
+# Get file of real motion exclusions
+if args.motion is not None:
+    mot_file = args.motion[0]
+    infix = "maskedframes"
+else:
+    mot_file = None
+    infix = "randomframes"
 
-    else:
-        return(False)
+if cens_pct == 1:
+    print("Warning: Censoring percentage was set to 100%: "
+          f"This still censors frames at FD > {fd_thresh}, and sets {infix} to "
+          f"'_{infix}-all_'.")
 
 def make_design_matrix(event_file, image_file):
 
@@ -101,6 +104,7 @@ def run_at_extra_mask(model, confounds, events, sample_mask, outdir, sub, task,
     if isinstance(total_mask, float):
 
         # If a proportion is given, randomly subsample frames
+        infix="randomframes"
 
         if total_mask < 1:
 
@@ -108,6 +112,12 @@ def run_at_extra_mask(model, confounds, events, sample_mask, outdir, sub, task,
             n_scans = [int(img.header["dim"][4]) for img in imgs]
 
             frames_to_keep = [round(total_mask * x) for x in n_scans]
+            print(frames_to_keep)
+
+            # Make sure the same number of frames are extracted from each
+            # run - not sure why it ever wouldn't be
+            assert len(set(frames_to_keep)) == 1, "Mismatched frame lengths"
+            total_frames = frames_to_keep[0]
 
             try:
                 new_list_of_frames = [sample_sample_mask(x, n) for x, n in
@@ -118,10 +128,13 @@ def run_at_extra_mask(model, confounds, events, sample_mask, outdir, sub, task,
 
         elif total_mask == 1:
 
-            print("Proportion = 1.0, doing no changes to sample mask!")
+            # print("Proportion = 1.0, doing no changes to sample mask!")
             new_list_of_frames = sample_mask
+            total_frames = "all"
 
     elif isinstance(total_mask, list):
+
+        infix="maskedframes"
 
         # If a list of frames to keep was given, intersect with the real data
         #   to find all the frames to keep (that way a bad frame was never
@@ -134,37 +147,45 @@ def run_at_extra_mask(model, confounds, events, sample_mask, outdir, sub, task,
 
         print()
         print(f"{sub} {task}, total frames: {total_frames}")
-        print("#################")
 
-        # if os.path.exists(f"{outdir}/"):
-        #     print(f"Output directory {outdir} already exists!")
-        #     return()
+    # Check that this hasn't been done already
+    prefix=f"sub-{sub}_task-{task}_{infix}-{total_frames}"
 
-    # Create and fit the model
-    model.fit(
-        run_imgs=fmri_filenames,
-        events=events,
-        confounds=confounds,
-        sample_masks=new_list_of_frames
-    )
+    prefix_files = glob.glob(f"{out_sub_task}/{prefix}_*.nii.gz")
 
-    # Load contrasts
+    if len(prefix_files) > 0:
 
-    with open(contrasts_file, 'r') as f:
-        contrasts = json.load(f)
+        print(f"Error:   Found {len(prefix_files)} files with the prefix "
+              f"{prefix} in {out_sub_task}, not recreating!")
 
-    save_glm_to_bids(model=model, contrasts=contrasts, out_dir=outdir,
-                        prefix=f"sub-{sub}_task-{task}_nframes-{total_frames}")
+        return(False)
 
+    else:
+
+        # Create and fit the model
+        model.fit(
+            run_imgs=fmri_filenames,
+            events=events,
+            confounds=confounds,
+            sample_masks=new_list_of_frames
+        )
+
+        # Load contrasts
+
+        with open(contrasts_file, 'r') as f:
+            contrasts = json.load(f)
+
+        save_glm_to_bids(model=model, contrasts=contrasts, out_dir=outdir,
+                         prefix=prefix)
+
+        return(True)
 
 for sub in sub_labels:
 
-    print(f"Working on sub {sub} {task_label}")
+    print(f"Info:    Working on sub {sub} {task_label}")
 
     out_sub_task=f"{out_dir}/sub-{sub}/task-{task_label}/"
-
-    if directory_exists(f"{out_sub_task}"):
-        continue
+    os.makedirs(out_sub_task, exist_ok=True)
 
     # From derivatives folder, find the preprocessed BOLD files
 
@@ -175,7 +196,6 @@ for sub in sub_labels:
                                "_desc-preproc_bold.nii.gz")
 
     fmri_filenames.sort()
-    # print(fmri_filenames)
 
     # Create confounds and sample mask from derivatives
 
@@ -185,7 +205,7 @@ for sub in sub_labels:
         motion="basic",
 
         scrub=0,
-        fd_threshold=1.0,
+        fd_threshold=fd_thresh,
         std_dvars_threshold=1.5
     )
 
@@ -196,7 +216,6 @@ for sub in sub_labels:
                                 f"*_task-{task_label}*_events.tsv")
 
     event_filenames.sort()
-    # print(event_filenames)
 
     # Create design matrix (HRF) based on event file
 
@@ -215,37 +234,20 @@ for sub in sub_labels:
         minimize_memory=False
     )
 
-    if mot_file is None:
+    with tempfile.TemporaryDirectory() as tmpdirname:
 
-        step=0.1
-        for i in np.arange(0.5, 1 + step, step):
+        print(f"Info:    Working in temp directory {tmpdirname}")
 
-            i = round(i, 2)
-            run_at_extra_mask(model, confounds, event_filenames, sample_mask,
-                              f"{out_dir}/sub-{sub}/", sub, task_label,
-                              total_mask=i)
+        if mot_file is None:
 
-    else:
+            run_complete = run_at_extra_mask(model, confounds, event_filenames,
+                                             sample_mask, f"{tmpdirname}/",
+                                             sub, task_label,
+                                             total_mask=cens_pct)
 
-        motion = pd.read_csv(mot_file)
-        motion_sorted = motion.sort_values(by="cens1mm")
-        info, fd = select_motion(motion, mot_n)
+            if run_complete:
 
-        # print(motion.shape)
+                statmaps = glob.glob(f"{tmpdirname}/*_stat-t_*")
 
-        for index, row in fd.iterrows():
-
-            # This is a list of T/F values
-            r = row.to_list()
-            r_indices = [i for i, x in enumerate(r) if not x]
-
-            # print(sample_mask)
-
-            run_at_extra_mask(model, confounds, event_filenames, sample_mask,
-                              f"{out_dir}/sub-{sub}/task-{task_label}",
-                              sub, task_label,
-                              total_mask=r_indices)
-
-        # Do this last so as to not create directory to check for existence
-        info_file = f"{out_dir}/sub-{sub}/task-{task_label}/info.csv"
-        info.to_csv(info_file)
+                [shutil.copy2(s, out_sub_task) for s in statmaps]
+                print(f"Info:    Copied stat-t maps to {out_sub_task}")
