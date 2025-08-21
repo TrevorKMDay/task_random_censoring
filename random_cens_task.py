@@ -11,8 +11,7 @@ import shutil
 from pathlib import Path
 
 # Nilearn imports
-from nilearn.glm.first_level import make_first_level_design_matrix, \
-    FirstLevelModel
+from nilearn.glm.first_level import FirstLevelModel
 from nilearn.interfaces.fmriprep import load_confounds
 from nilearn.interfaces.bids import save_glm_to_bids
 from nilearn.image import image
@@ -49,13 +48,15 @@ args = parser.parse_args()
 bids_dataset = args.bids_dir
 derivatives_folder = args.derivatives_dir
 task_label = args.task
-space_label = "MNI152NLin2009cAsym"
+space_label = "MNI152NLin2009cAsym" # TO DO: allow to change this
 sub_labels = args.subs
 out_dir = args.out_dir
 contrasts_file = args.contrast_file
 
 cens_pct = args.cens_pct
 fd_thresh = args.fd
+
+# CHECK INPUTS =====
 
 assert cens_pct > 0, "Censoring percentage must be > 0"
 assert cens_pct <= 1, "Censoring percentage cannot be > 1."
@@ -74,33 +75,17 @@ if cens_pct == 1:
           f"This still censors frames at FD > {fd_thresh}, and sets {infix} to "
           f"'_{infix}-all_'.")
 
-def make_design_matrix(event_file, image_file):
-
-    img = image.load_img(image_file)
-    n_scans = int(img.header["dim"][4])
-    tr = img.header["pixdim"][4]
-
-    frame_times = (np.arange(n_scans) * tr)
-
-    events = make_first_level_design_matrix(
-        frame_times=frame_times,
-        events=event_file,
-        hrf_model="spm",
-        drift_model=None
-    )
-
-    return(events)
+# FUNCTIONS =====
 
 def sample_sample_mask(sample_mask, n):
 
     index = np.random.choice(sample_mask.shape[0], n, replace=False)
     return(sample_mask[index])
 
-def run_at_percentage(model, confounds, events, sample_mask, outdir, sub, task,
+def run_at_percentage(model, confounds, events, sample_mask, sub, task,
                       mask_pct=1):
 
     # If a proportion is given, randomly subsample frames
-    infix="randomframes"
 
     imgs = [image.load_img(x) for x in fmri_filenames]
     n_scans = [int(img.header["dim"][4]) for img in imgs]
@@ -120,7 +105,7 @@ def run_at_percentage(model, confounds, events, sample_mask, outdir, sub, task,
         except ValueError:
             print(f"Error:   Requested {100 * mask_pct}% of {n_scans}, "
                     "but not enough good frames!")
-            return(False)
+            return(None)
 
     elif mask_pct == 1:
 
@@ -138,11 +123,11 @@ def run_at_percentage(model, confounds, events, sample_mask, outdir, sub, task,
     print(f"Info:")
     print(f"  Total frames: {n_scans}")
     print(f"  % requested:  {round(mask_pct * 100)}% / {p_scans}")
-    print(f"  Using:        {new_length} ({total_frames}) = {p_used}%")
+    print(f"  Using:        {new_length} (total: {total_frames}) = {p_used}%")
 
     # Check that this hasn't been done already
+    infix="randomframes"
     prefix=f"sub-{sub}_task-{task}_{infix}-{total_frames}"
-
     prefix_files = glob.glob(f"{out_sub_task}/{prefix}_*.nii.gz")
 
     if len(prefix_files) > 0:
@@ -150,49 +135,68 @@ def run_at_percentage(model, confounds, events, sample_mask, outdir, sub, task,
         print(f"Error:   Found {len(prefix_files)} files with the prefix "
             f"{prefix} in {out_sub_task}, not recreating!")
 
-        return(False)
+        return(None)
 
-    else:
+    # Create and fit the model
+    model.fit(
+        run_imgs=fmri_filenames,
+        events=events,
+        confounds=confounds,
+        sample_masks=new_list_of_frames
+    )
 
-        # Create and fit the model
-        model.fit(
-            run_imgs=fmri_filenames,
-            events=events,
-            confounds=confounds,
-            sample_masks=new_list_of_frames
-        )
-
-        with open(contrasts_file, 'r') as f:
-            contrasts = json.load(f)
-
-        save_glm_to_bids(model=model, contrasts=contrasts, out_dir=outdir,
-                         prefix=prefix)
-
-        return(True)
+    return(model, prefix)
 
 
-def run_using_vector(model, confounds, events, sample_mask, outdir, sub, task,
-                      total_mask=1):
+def run_using_vector(model, confounds, events, sample_mask, sub, task,
+                     frames_to_keep):
 
-        infix="maskedframes"
+    imgs = [image.load_img(x) for x in fmri_filenames]
+    n_scans = [int(img.header["dim"][4]) for img in imgs]
+    total_length = sum(n_scans)
 
-        # If a list of frames to keep was given, intersect with the real data
-        #   to find all the frames to keep (that way a bad frame was never
-        #   included)
-        new_list_of_frames = [set(i.tolist()) & set(total_mask)
-                              for i in sample_mask]
-        new_list_of_frames = [np.array(list(x)) for x in new_list_of_frames]
+    # This is the actual % of KEPT frames
+    mask_pct = len(frames_to_keep) / n_scans[0]
+    p_scans = [round(mask_pct * n) for n in n_scans]
 
-        total_frames = sum([len(x) for x in new_list_of_frames])
+    # This intersects the new list with the list of good frames so that
+    #   only good frames are always modeled, which means the actual included
+    #   % will be less than or equal to the requested amount.
+    new_list_of_frames = [np.array(list(set(frames_to_keep) & set(x)))
+                          for x in sample_mask]
 
-        print()
-        print(f"{sub} {task}, total frames: {total_frames}")
+    new_length = [len(x) for x in new_list_of_frames]
+    total_frames = sum(new_length)
+    p_used = round(100 * total_frames / total_length)
 
+    print(f"Info:")
+    print(f"  Total frames: {n_scans}")
+    print(f"  % requested:  {round(mask_pct * 100)}% / {p_scans}")
+    print(f"  Using:        {new_length} (total: {total_frames}) = {p_used}%")
 
-        # Load contrasts
+    # Check that this hasn't been done already
+    infix="maskedframes"
+    prefix=f"sub-{sub}_task-{task}_{infix}-{total_frames}"
+    prefix_files = glob.glob(f"{out_sub_task}/{prefix}_*.nii.gz")
 
+    if len(prefix_files) > 0:
 
-        return(True)
+        print(f"Error:   Found {len(prefix_files)} files with the prefix "
+              f"{prefix} in {out_sub_task}, not recreating!")
+
+        return(None)
+
+    # Create and fit the model
+    model.fit(
+        run_imgs=fmri_filenames,
+        events=events,
+        confounds=confounds,
+        sample_masks=new_list_of_frames
+    )
+
+    return(model, prefix)
+
+# MAIN LOOP =====
 
 for sub in sub_labels:
 
@@ -233,13 +237,7 @@ for sub in sub_labels:
 
     event_filenames.sort()
 
-    # Create design matrix (HRF) based on event file
-
-    # events = [make_design_matrix(e, f) for f, e in
-    #           zip(fmri_filenames, event_filenames)]
-
     # Create the first level model
-
     model = FirstLevelModel(
         t_r=3.0,
         slice_time_ref=0.5,
@@ -248,25 +246,76 @@ for sub in sub_labels:
         smoothing_fwhm=5.0,
         drift_model=None,
         minimize_memory=False
+
     )
 
-    with tempfile.TemporaryDirectory() as tmpdirname:
+    if mot_file is not None:
 
-        print(f"Info:    Working in temp directory {tmpdirname}")
+        motion = pd.read_csv(mot_file)
 
-        if mot_file is None:
+        motion_sorted = motion.sort_values(by="cens1mm")
+        inclusion = [1 - x for x in motion_sorted["cens1mm"]]
 
-            print(f"Info:    Sampling {100 * cens_pct}% of good frames.")
+        cens_pct_range = [round(cens_pct - 0.02, 2), round(cens_pct + 0.02, 2)]
 
-            run_ok = run_at_percentage(model, confounds, event_filenames,
-                                       good_volumes, tmpdirname,
-                                       sub, task_label, cens_pct)
+        rows_in_range = [x >= cens_pct_range[0] and x <= cens_pct_range[1] for
+                         x in inclusion]
 
+        if sum(rows_in_range) == 0:
 
-        # Only copy files if the run was complete (returns True/False)
-        if run_ok:
+            print(f"Error:    No rows in range {cens_pct_range} to choose "
+                    "from!")
 
+            continue
+
+        else:
+
+            print(f"Info:    {sum(rows_in_range)} in range "
+                    f"{cens_pct_range} to choose from! Randomly choosing 1.")
+
+            motion_rows = motion_sorted.iloc[rows_in_range]
+            motion_row = motion_rows.sample(n = 1)
+
+            info_cols = ["sub", "task", "run", "cens1mm"]
+
+            # Keep all frames where FD < threshold
+            fd = motion_row.drop(info_cols, axis=1).values.tolist()[0]
+
+            # Replace NaNs with 0 so they pass
+            fd = [f if not np.isnan(f) else 0 for f in fd]
+            frames_to_keep = [ix for ix, f in enumerate(fd) if f < fd_thresh]
+
+            print("Info:    Using a randomly selected vector at about "
+                    f"{cens_pct}")
+
+            fitted_model, prefix = run_using_vector(model, confounds,
+                                                    event_filenames,
+                                                    good_volumes, sub,
+                                                    task_label,
+                                                    frames_to_keep)
+
+    else:
+
+        print(f"Info:    Sampling {100 * cens_pct}% of good frames.")
+        fitted_model, prefix = run_at_percentage(model, confounds,
+                                                event_filenames,
+                                                good_volumes, sub, task_label,
+                                                cens_pct)
+
+    # Only execute model and copy files if the run was complete
+    if fitted_model is not None:
+
+        with open(contrasts_file, 'r') as f:
+            contrasts = json.load(f)
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+
+            print(f"Info:    Working in temp directory {tmpdirname}")
+
+            save_glm_to_bids(model=fitted_model, contrasts=contrasts,
+                             out_dir=tmpdirname, prefix=prefix)
+
+            # Find and copy files from temp dir to output dir
             statmaps = glob.glob(f"{tmpdirname}/*_stat-t_*")
-
             [shutil.copy2(s, out_sub_task) for s in statmaps]
             print(f"Info:    Copied stat-t maps to {out_sub_task}")
