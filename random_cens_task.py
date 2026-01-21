@@ -79,11 +79,41 @@ if cens_pct == 1:
 
 def sample_sample_mask(sample_mask, n):
 
+    """
+    Choose n good frames from a list (sample_mask) of good frames and returns
+    a list of good frames of length n.
+
+    Args:
+        sample_mask (list): Good frames, e.g. [0, 1, 2, 5, 10, ...]
+        n (int): Number of frames to sample (without replacement)
+
+    Returns:
+        list: Randomly selected good frames, e.g. [0, 5, 10, ...]
+    """
+
     index = np.random.choice(sample_mask.shape[0], n, replace=False)
     return(sample_mask[index])
 
 def run_at_percentage(model, confounds, events, sample_mask, sub, task,
                       mask_pct=1):
+
+    """
+    Given a first-level model (model) and the associated bits (confounds,
+    events) for given sub, task, randomly sample some percent (mask_pct) of the
+    good frames (sample_mask)
+
+    Args:
+        model (FirstLevelModel): A nilearn first-evel model
+        confound, sample_mask: Parameters from load_confounds
+        events (table): Event timings
+        sub (str): sub identifier
+        task (str): task identifier
+        mask_pct (float): Mask percentage, >0, <=1
+
+    Returns:
+        model: Fitted model
+        prefix: Prefix to use to save files
+    """
 
     # If a proportion is given, randomly subsample frames
 
@@ -150,6 +180,25 @@ def run_at_percentage(model, confounds, events, sample_mask, sub, task,
 
 def run_using_vector(model, confounds, events, sample_mask, sub, task,
                      frames_to_keep):
+
+    """
+    Given a first-level model (model) and the associated bits (confounds,
+    events) for given sub, task, intersect the actual good frames with the
+    frames to keep.
+
+    Args:
+        model (FirstLevelModel): A nilearn first-evel model
+        confound, sample_mask: Parameters from load_confounds
+        events (table): Event timings
+        sub (str): sub identifier
+        task (str): task identifier
+        frames_to_keep: List of frames to keep, which is checked against
+            sample_mask so that only good frames are ever kept.
+
+    Returns:
+        model: Fitted model
+        prefix: Prefix to use to save files
+    """
 
     imgs = [image.load_img(x) for x in fmri_filenames]
     n_scans = [int(img.header["dim"][4]) for img in imgs]
